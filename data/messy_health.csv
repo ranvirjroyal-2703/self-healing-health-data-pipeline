@@ -1,0 +1,13 @@
+patient_id,patient_name,age,lab_result,status,visit_date
+P1001,  Ada Lovelace ,42,120,completed,2026-01-03
+P1001,Ada Lovelace,42,120,completed,2026-01-03
+P1002,Alan Turing,not-a-number,140,pending,2026/02/11
+P1003,,35,80,PENDING,11-03-2026
+P1004,Grace Hopper,,110,done,
+P1004,Grace Hopper,38,110,done,2026-03-01
+P1005,Katherine Johnson,  29 ,95,Completed,2026-03-02
+,,,
+P1006,Dorothy Vaughan,55,130,cancelled,2026-04-09
+P1006,Dorothy Vaughan,55,130,cancelled,2026-04-09
+P1007,Mary Jackson,abc,75,refunded,bad-date
+P1008,Radia Perlman,61,, ,2026-05-20
