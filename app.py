@@ -59,13 +59,14 @@ if st.button("Run judge demo", type="primary"):
             right.markdown("**Round 2 — rewritten from that stderr**")
             right.code(healed["code"], language="python")
             if healed["result"].success:
-                right.success(f"Repaired run succeeded in {healed['result'].duration_sec}s. Cost {healed['cost']}.")
+                status = "validated" if healed.get("validated") else f"failed validation: {healed.get('validation_reason')}"
+                right.success(f"Repaired run succeeded in {healed['result'].duration_sec}s. Cost {healed['cost']}. Status: {status}")
                 right.code((healed["result"].stdout or "")[:900])
             else:
                 right.warning("Repair ran, but this attempt still failed.")
                 right.code((healed["result"].stderr or "")[:700])
 
-        st.subheader("2. Which clean is cheapest")
+        st.subheader("2. Which clean is cheapest (validated only)")
         ranked = agent.rank(attempts)
         st.dataframe(pd.DataFrame([
             {
@@ -73,18 +74,30 @@ if st.button("Run judge demo", type="primary"):
                 "Strategy": item["strategy"]["name"],
                 "Round": item["round"],
                 "Success": bool(item["result"].success and not item["result"].timed_out),
+                "Validated": item.get("validated", False),
+                "Reason": item.get("validation_reason", ""),
                 "Seconds": item["result"].duration_sec,
                 "Memory": item["memory_limit"],
                 "Cost": item["cost"],
             }
             for index, item in enumerate(ranked)
         ]), use_container_width=True)
+
         best = agent.select_best(attempts)
-        if best and best["result"].success:
+        if best and best.get("cleaned_csv"):
             st.success(
                 f"Ship `{best['strategy']['name']}` for the health report. "
-                f"Cost {best['cost']} ({best['result'].duration_sec}s at {best['memory_limit']})."
+                f"Cost {best['cost']} ({best['result'].duration_sec}s at {best['memory_limit']}). "
+                f"Validation: {best.get('validation_reason')}"
             )
+            st.download_button(
+                label="Download validated cleaned CSV",
+                data=best["cleaned_csv"],
+                file_name="cleaned_health_data.csv",
+                mime="text/csv",
+            )
+        else:
+            st.warning("No strategy passed both execution and validation. Check the table above.")
 
         st.subheader("3. Blast radius = zero")
         st.write("The same sandbox now runs an infinite loop. The host process is not the one that dies.")
