@@ -42,13 +42,19 @@ class SandboxRunner:
                 handle.write(code)
             os.chmod(script_path, 0o644)
 
+            # Use a unique container name so we can kill it on timeout
+            container_name = f"sandbox-{os.getpid()}-{int(time.time()*1000)}"
+
             cmd = [
                 "docker", "run", "--rm",
+                "--name", container_name,
                 "--memory", self.memory_limit,
                 "--cpus", self.cpu_limit,
+                "--pids-limit", "64",
                 "--user", "1000:1000",
                 "--cap-drop", "ALL",
                 "--security-opt", "no-new-privileges",
+                "--read-only",
                 "-v", f"{tmpdir}:/workspace:ro",
                 "-w", "/workspace",
             ]
@@ -81,6 +87,12 @@ class SandboxRunner:
                 )
             except subprocess.TimeoutExpired as exc:
                 duration = round(time.time() - start, 2)
+                # Explicitly kill the container
+                try:
+                    subprocess.run(["docker", "kill", container_name], capture_output=True, timeout=5)
+                    subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, timeout=5)
+                except Exception:
+                    pass
                 stdout = exc.stdout or ""
                 if isinstance(stdout, bytes):
                     stdout = stdout.decode("utf-8", errors="replace")
@@ -90,7 +102,7 @@ class SandboxRunner:
                 return SandboxResult(
                     success=False,
                     stdout=stdout,
-                    stderr=stderr + "\n[TIMEOUT] Process killed by sandbox. Host was not touched.",
+                    stderr=stderr + "\n[TIMEOUT] Container killed by sandbox. Host was not touched.",
                     returncode=-1,
                     duration_sec=duration,
                     timed_out=True,
