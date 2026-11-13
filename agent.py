@@ -1,11 +1,13 @@
 """Self-healing, cost-aware data cleaning agent for health exports."""
 
 import base64
+import io
 import json
 import os
 import re
 from typing import Any
 
+import pandas as pd
 from openai import OpenAI
 
 from sandbox_runner import SandboxResult, SandboxRunner
@@ -28,6 +30,33 @@ STORY = (
     "Duplicate patient ids, a blank row, and a non-numeric age will break the report. "
     "The agent has to clean that file. It is not allowed to run on the host."
 )
+
+REQUIRED_COLUMNS = {"patient_id", "patient_name", "age", "lab_result", "status", "visit_date"}
+
+
+def validate_cleaned(df: pd.DataFrame, original_row_count: int) -> tuple[bool, str]:
+    """Return (is_valid, reason). Rejects exit-0 strategies that still have bad data."""
+    if df is None or df.empty:
+        return False, "Empty result"
+    missing = REQUIRED_COLUMNS - set(df.columns)
+    if missing:
+        return False, f"Missing columns: {missing}"
+    # No fully blank rows
+    if df.dropna(how="all").shape[0] != df.shape[0]:
+        return False, "Contains fully blank rows"
+    # Patient IDs should be unique (or at least no exact duplicate rows)
+    if df.duplicated().any():
+        return False, "Contains exact duplicate rows"
+    # Age and lab_result should be numeric where present
+    for col in ("age", "lab_result"):
+        if col in df.columns:
+            numeric = pd.to_numeric(df[col], errors="coerce")
+            if numeric.isna().sum() > df[col].isna().sum():
+                return False, f"Non-numeric values remain in {col}"
+    # Record preservation: do not drop more than 50% without flagging (soft)
+    if len(df) < original_row_count * 0.5:
+        return False, "Dropped more than 50% of rows — possible data loss"
+    return True, "OK"
 
 
 class DataPipelineAgent:
@@ -129,25 +158,54 @@ df = pd.read_csv(StringIO(raw))
 print("ROWS:", len(df))
 print("COLUMNS:", list(df.columns))
 print("---CLEANED---")
-print(df.head(8).to_csv(index=False))
+print(df.to_csv(index=False))
 '''
         return self.sandbox.run(full_code)
+
+    def extract_cleaned_csv(self, result: SandboxResult) -> str | None:
+        if not result.success or not result.stdout:
+            return None
+        marker = "---CLEANED---"
+        if marker not in result.stdout:
+            return None
+        return result.stdout.split(marker, 1)[1].strip()
 
     def run_with_healing(self, strategies: list[dict[str, str]], data_csv: str, goal: str) -> list[dict[str, Any]]:
         attempts: list[dict[str, Any]] = []
         memory_limit = self.sandbox.memory_limit
+        original_rows = len(data_csv.strip().splitlines()) - 1  # rough
         for strat in strategies:
             code = strat["code"]
             first = self.execute_strategy(code, data_csv)
-            attempts.append(self._pack(strat, code, first, 1, memory_limit))
-            if first.success and not first.timed_out:
+            cleaned_csv = self.extract_cleaned_csv(first)
+            valid, reason = (False, "no output")
+            if cleaned_csv:
+                try:
+                    cleaned_df = pd.read_csv(io.StringIO(cleaned_csv))
+                    valid, reason = validate_cleaned(cleaned_df, original_rows)
+                except Exception as e:
+                    valid, reason = False, str(e)
+            packed = self._pack(strat, code, first, 1, memory_limit)
+            packed["validated"] = valid
+            packed["validation_reason"] = reason
+            packed["cleaned_csv"] = cleaned_csv if valid else None
+            attempts.append(packed)
+            if first.success and not first.timed_out and valid:
                 continue
             error = first.stderr or first.stdout or "unknown failure"
             repaired = self.heal(code, error, goal)
             if not repaired or repaired == code:
                 continue
             second = self.execute_strategy(repaired, data_csv)
-            attempts.append(self._pack(
+            cleaned_csv2 = self.extract_cleaned_csv(second)
+            valid2, reason2 = (False, "no output")
+            if cleaned_csv2:
+                try:
+                    cleaned_df2 = pd.read_csv(io.StringIO(cleaned_csv2))
+                    valid2, reason2 = validate_cleaned(cleaned_df2, original_rows)
+                except Exception as e:
+                    valid2, reason2 = False, str(e)
+            packed2 = self._pack(
                 {**strat, "name": strat["name"] + " (healed)"},
                 repaired,
                 second,
@@ -155,7 +213,11 @@ print(df.head(8).to_csv(index=False))
                 memory_limit,
                 parent=strat["name"],
                 error=error,
-            ))
+            )
+            packed2["validated"] = valid2
+            packed2["validation_reason"] = reason2
+            packed2["cleaned_csv"] = cleaned_csv2 if valid2 else None
+            attempts.append(packed2)
         return attempts
 
     def _pack(self, strat, code, result, round_n, memory_limit, parent=None, error=None) -> dict[str, Any]:
@@ -171,9 +233,19 @@ print(df.head(8).to_csv(index=False))
         }
 
     def rank(self, attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return sorted(attempts, key=lambda item: (not item["result"].success, item["cost"], item["round"]))
+        return sorted(
+            attempts,
+            key=lambda item: (
+                not (item["result"].success and item.get("validated", False)),
+                item["cost"],
+                item["round"],
+            ),
+        )
 
     def select_best(self, attempts: list[dict[str, Any]]) -> dict[str, Any]:
         ranked = self.rank(attempts)
-        winners = [item for item in ranked if item["result"].success and not item["result"].timed_out]
-        return winners[0] if winners else (ranked[0] if ranked else {})
+        winners = [
+            item for item in ranked
+            if item["result"].success and not item["result"].timed_out and item.get("validated", False)
+        ]
+        return winners[0] if winners else {}
